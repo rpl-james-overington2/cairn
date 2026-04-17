@@ -1,0 +1,25 @@
+hooks/stop_hook.py
+  c2523960ca0cb5f5 409-411,419,421,424-437
+.claude/rules/memory-system.md
+  c2523960ca0cb5f5 12,21,23,26,29-32,58
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "development:1.1.9",
+  "base_commit_sha": "c73791355f2a2d21da0b395cc9a6aec74959b0c0",
+  "prompts": {
+    "c2523960ca0cb5f5": {
+      "agent_id": {
+        "tool": "github-copilot",
+        "id": "b2aaab2b-60a6-4d65-b878-33d6424783b1",
+        "model": "copilot/claude-sonnet-4-6"
+      },
+      "human_author": "James Overington <james.overington@roboticsplus.co.nz>",
+      "messages": [],
+      "total_additions": 30,
+      "total_deletions": 22,
+      "accepted_lines": 30,
+      "overriden_lines": 0
+    }
+  }
+}
