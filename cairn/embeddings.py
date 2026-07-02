@@ -979,6 +979,21 @@ def find_similar(
             if ce_active:
                 pre_filter = len(diverse)
                 above_floor = [r for r in diverse if r["ce_score"] >= floor]
+                if not above_floor:
+                    # Every candidate failed the CE floor. Fall back to the top
+                    # embedding-ranked candidate rather than emptying the result:
+                    # CROSS_ENCODER_SCORE_FLOOR_CUDA only clears ~51% of genuinely
+                    # engaged deliveries (see config.py calibration comment), so a
+                    # hard floor-empties-to-nothing policy measurably regresses
+                    # recall (confirmed against test_retrieval_quality.py: MRR
+                    # 0.5->0.375, R@5 0.5->0.375). The trade-off is an occasional
+                    # low-ce_score false positive riding through on embedding
+                    # similarity alone (e.g. memory_deliveries id 44299/44300,
+                    # ce_score=0.0019 for an off-topic cross-project memory).
+                    # Instrumented via this metric so real delivery data — not a
+                    # 20-query synthetic benchmark — can drive a future floor
+                    # recalibration instead of a blind exclude-or-not guess.
+                    _record_embed_metric("rerank_floor_emptied", len(diverse))
                 diverse = above_floor if above_floor else diverse[:1]
                 ce_min = min(r["ce_score"] for r in diverse) if diverse else 0
                 ce_max = max(r["ce_score"] for r in diverse) if diverse else 1
