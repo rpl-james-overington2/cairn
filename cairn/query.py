@@ -1612,6 +1612,26 @@ Commands:
   --dashboard [--port N]  Launch web dashboard (default port 8420)"""
 
 
+def _ephemeral_schema() -> tuple[set, set]:
+    """(table names, index names) present in the ephemeral db, empty on failure."""
+    try:
+        from cairn.config import EPHEMERAL_DB_PATH
+        if not os.path.exists(EPHEMERAL_DB_PATH):
+            return set(), set()
+        c = sqlite3.connect(EPHEMERAL_DB_PATH)
+        c.execute("PRAGMA busy_timeout=5000")
+        try:
+            tables = {r[0] for r in c.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            indexes = {r[0] for r in c.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL")}
+            return tables, indexes
+        finally:
+            c.close()
+    except Exception:
+        return set(), set()
+
+
 def check():
     """Validate Cairn system health — DB, hooks, daemon, embeddings."""
     import glob as _glob
@@ -1739,11 +1759,13 @@ def check():
             else:
                 fail("memories_fts table missing")
 
-            required_indexes = {"idx_memories_type", "idx_memories_topic", "idx_memories_project", "idx_metrics_event", "idx_history_memory_id"}
+            required_indexes = {"idx_memories_type", "idx_memories_topic", "idx_memories_project", "idx_history_memory_id"}
             existing_indexes = {r[0] for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL"
             ).fetchall()}
             missing_indexes = required_indexes - existing_indexes
+            if "idx_metrics_event" not in _eph_indexes:
+                missing_indexes = missing_indexes | {"idx_metrics_event (ephemeral)"}
             if not missing_indexes:
                 ok("All required indexes present")
             else:
