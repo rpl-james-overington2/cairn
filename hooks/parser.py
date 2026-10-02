@@ -33,7 +33,14 @@ class ParseResult(NamedTuple):
     keywords_explicit: bool = False   # True if 'keywords' was explicitly declared
     hash_claimed: Optional[int] = None  # Claimed response hash (h:NNN)
     is_compact: bool = False         # True if compact format was used
-    relevance_grades: tuple = ()     # (memory_id, grade 0-3, hard_neg) from rg — agent-as-teacher labels
+    relevance_grades: tuple = ()     # (memory_id, grade 0-3, hard_neg) from rg — legacy absolute scale
+    fit_pairs: tuple = ()            # (winner_id, loser_id) from fit — relative labels, the primary ask
+    fit_declared: bool = False       # fit field present at all (an explicit "none" is signal; absence is not)
+    # Which tolerance, if any, had to be applied to read the block ("multiline",
+    # "salvage"). Carried out to the caller rather than only logged so recovery
+    # RATE is countable: a recovery is a re-prompt turn that was not charged, and
+    # a rising rate is the signal that the emitted format has drifted.
+    recovery: Optional[str] = None
 
 
 # Sentinel for "no memory block found"
@@ -99,6 +106,68 @@ def _salvage_json(raw: str, max_fixes: int = 400):
     return None
 
 
+_LINKDEF_LINE = r"^\[(?:cairn-memory|cm)\]:\s*#\s*'(.+)'\s*$"
+_LINKDEF_MARK = r"^\[(?:cairn-memory|cm)\]:"
+
+
+def extract_linkdef_raw(text: str):
+    """-> (raw_json, recovery) for the LAST link-def block, or (None, None).
+
+    `recovery` names any tolerance that had to be applied, so the caller can
+    report it rather than silently accepting a degraded block.
+
+    Multi-line tolerance: JSON strings cannot contain a literal newline, so a
+    block that wrapped across lines is invalid JSON even though its content is
+    perfectly good. Rejecting it costs a full inference turn and — worse — the
+    resulting error names bad JSON, which sends the next attempt chasing quoting
+    bugs that do not exist. Rejoining is unambiguous, so do that instead.
+
+    Anchored to the LAST marker before the DOTALL match. Without that anchor a
+    greedy match would run from an EARLIER block in the conversation history all
+    the way to this one's closing quote, silently fusing two unrelated blocks.
+    """
+    # Anchor to the LAST marker before matching anything. Searching the whole
+    # text for a single-line block first would return an EARLIER, still-valid
+    # block from conversation history whenever this turn's block wrapped —
+    # storing a stale block, which is worse than reporting a failure.
+    starts = [m.start() for m in re.finditer(_LINKDEF_MARK, text, re.MULTILINE)]
+    if not starts:
+        return None, None
+    tail = text[starts[-1]:]
+
+    m = re.match(_LINKDEF_LINE, tail, re.MULTILINE)
+    if m:
+        return m.group(1), None
+    m = re.match(_LINKDEF_LINE, tail, re.DOTALL)
+    if m:
+        return re.sub(r"\s*\n\s*", " ", m.group(1)), "multiline"
+    return None, None
+
+
+def linkdef_diagnosis(text: str) -> Optional[str]:
+    """Why a present-but-unusable [cm] block failed. None when it is fine.
+
+    The hook previously reported "could not be parsed" for ANY block its strict
+    single-line regex missed, which is a different condition from invalid JSON
+    and sent several debugging attempts after the wrong cause. Name the actual
+    failure instead.
+    """
+    if not re.search(_LINKDEF_MARK, text, re.MULTILINE):
+        return None
+    raw, _recovery = extract_linkdef_raw(text)
+    if raw is None:
+        return ("The block is present but its JSON could not be located: it must "
+                "sit between single quotes after [cm]: # and the closing quote "
+                "must be the last character on its line.")
+    try:
+        _json.loads(raw)
+        return None
+    except (_json.JSONDecodeError, ValueError):
+        if _salvage_json(raw) is not None:
+            return None
+        return linkdef_error_locus(text)
+
+
 def linkdef_error_locus(text: str) -> Optional[str]:
     """For a [cm] block that fails to parse even after salvage, return a short
     human-readable pointer to the exact break so the re-prompt can be targeted
@@ -138,15 +207,12 @@ def _parse_linkdef(text: str) -> Optional[ParseResult]:
 
     Accepts [cairn-memory] or [cm] as the link label.
     """
-    # Scan for the link definition line(s) — take the last one if multiple
-    matches = re.findall(
-        r"^\[(?:cairn-memory|cm)\]:\s*#\s*'(.+)'\s*$",
-        text, re.MULTILINE
-    )
-    if not matches:
+    raw_json, recovery = extract_linkdef_raw(text)
+    if raw_json is None:
         return None
-
-    raw_json = matches[-1]
+    if recovery:
+        log(f"Link-def recovered via {recovery} tolerance — block was valid but "
+            f"not on a single line")
     try:
         data = _json.loads(raw_json)
     except (_json.JSONDecodeError, ValueError) as e:
@@ -158,6 +224,7 @@ def _parse_linkdef(text: str) -> Optional[ParseResult]:
             log(f"Link-def JSON parse error: {e} — raw: {raw_json[:120]}")
             return None
         log(f"Link-def JSON salvaged after parse error ({e})")
+        recovery = f"{recovery}+salvage" if recovery else "salvage"
 
     if not isinstance(data, dict):
         log(f"Link-def JSON is not a dict: {type(data)}")
@@ -242,6 +309,13 @@ def _parse_linkdef(text: str) -> Optional[ParseResult]:
     # Grammar lives in one place: cairn.relevance.parse_relevance_grades.
     from cairn.relevance import parse_relevance_grades
     relevance_grades = parse_relevance_grades(_g(data, "rg", "relevance_grades", default=[]))
+    from cairn.relevance import parse_fit
+    _fit_raw = _g(data, "fit", "relative_fit", default=None)
+    fit_pairs = parse_fit(_fit_raw)
+    # An explicit "none"/{} means "nothing stood out"; a missing field means the
+    # agent never considered it. Conflating them is what made the old coverage
+    # figure uninterpretable, so the distinction is preserved here.
+    fit_declared = _fit_raw is not None
 
     return ParseResult(
         entries=entries,
@@ -253,12 +327,15 @@ def _parse_linkdef(text: str) -> Optional[ParseResult]:
         retrieval_outcome=retrieval_outcome,
         keywords=keywords,
         intent=intent,
+        recovery=recovery,
         complete_explicit=True,
         context_explicit=True,
         keywords_explicit=bool(keywords),
         hash_claimed=None,
         is_compact=False,
         relevance_grades=tuple(relevance_grades),
+        fit_pairs=tuple(fit_pairs),
+        fit_declared=fit_declared,
     )
 
 

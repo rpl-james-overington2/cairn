@@ -23,6 +23,10 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "cairn.db")
 # source of truth so the hook self-heal probe (hooks.hook_helpers.get_ephemeral_conn)
 # verifies the FULL set and can never silently fall behind a newly-added table —
 # the metrics-only probe is exactly how "no such table: hook_state" went unrepaired.
+# delivery_fit_pairs is deliberately NOT here — it holds agent fit labels, which
+# are training data and cannot be regenerated (a label requires an agent to have
+# judged one specific turn's context). It lives in the durable DB; everything in
+# this tuple is instrumentation or rebuildable derived state.
 EPHEMERAL_TABLES = ("metrics", "hook_state", "pair_assessments",
                     "pending_writes", "calibration_deliveries", "memory_deliveries")
 
@@ -647,11 +651,28 @@ def init():
         conn.execute(
             "INSERT INTO schema_version (version, description) VALUES (15, 'ab_experiments table — automated write-side A/B assessment + changeover tracking')"
         )
+    _init_fit_pairs(conn)
     conn.commit()
     conn.close()
     print(f"Database initialized at {DB_PATH}")
 
+def _init_fit_pairs(conn):
+    """Agent relative-fit labels — durable, see apply_fit_labels for why."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS delivery_fit_pairs (
+            id INTEGER PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            turn_index INTEGER,
+            winner_id INTEGER NOT NULL,
+            loser_id INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fit_pairs_session "
+                 "ON delivery_fit_pairs(session_id, turn_index)")
+
+
 def init_ephemeral(path=None):
+
     """Initialize the ephemeral DB (metrics, hook_state, pair_assessments)."""
     if path is None:
         from cairn.config import EPHEMERAL_DB_PATH
@@ -761,6 +782,8 @@ def init_ephemeral(path=None):
             scope         TEXT,
             engaged       INTEGER,
             engaged_score REAL,
+            engaged_method TEXT,
+            gate_status   TEXT,
             delivered_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -772,10 +795,26 @@ def init_ephemeral(path=None):
     #   engaged       — 1 used / 0 not-used / NULL no-signal (the PRIMARY label)
     #   engaged_score — distinctive-term overlap ratio 0..1; -1.0 = evaluated but
     #                   undecidable (memory redundant with the prompt); NULL = not
-    #                   yet evaluated (the unscored sentinel).
+    #                   yet evaluated (the unscored sentinel). Rows recovered by the
+    #                   semantic second chance (cairn.relevance.semantic_engaged)
+    #                   instead store cos(response, memory) — the same 0..1 range,
+    #                   but a cosine rather than a lexical overlap ratio.
+    #   engaged_method — which pass produced the verdict: "lexical", "semantic"
+    #                   (live second chance), or "semantic-backfill" (retro-scored
+    #                   by cairn/backfill_semantic_engagement.py). Without this the
+    #                   two measurement bases are indistinguishable in aggregate
+    #                   stats, and a rate computed across the boundary is invalid.
+    #   gate_status   — why a row has (or lacks) a reranker_model: "reranked",
+    #                   "gate-unavailable" (daemon down mid-request), "disabled",
+    #                   "ungated-by-design", "below-min-candidates". A NULL model
+    #                   alone conflates the unavailable case with the by-design
+    #                   case, and a reranker comparison that re-admits the former
+    #                   manufactures ungated-vs-reranked results. Rows predating
+    #                   this column stay NULL and must be excluded, not assumed.
     for _col, _ctype in (("reranker_model", "TEXT"), ("score_components", "TEXT"),
                          ("layer", "TEXT"), ("scope", "TEXT"),
-                         ("engaged", "INTEGER"), ("engaged_score", "REAL")):
+                         ("engaged", "INTEGER"), ("engaged_score", "REAL"),
+                         ("engaged_method", "TEXT"), ("gate_status", "TEXT")):
         try:
             conn.execute(f"ALTER TABLE memory_deliveries ADD COLUMN {_col} {_ctype}")
         except sqlite3.OperationalError:

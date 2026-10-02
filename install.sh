@@ -60,18 +60,18 @@ if ! "$VENV_PYTHON" -c "import torch" 2>/dev/null; then
         echo "Installing PyTorch (CUDA)..."
         # Use PIPESTATUS so pip exit code (not grep's) determines success.
         # grep -E '...' || true keeps the pipeline alive if no output line matches the filter.
-        "$VENV_PATH/bin/pip" install torch 2>&1 \
+        "$VENV_PYTHON" -m pip install torch 2>&1 \
             | { grep -E "^(Collecting|Downloading|Installing|Successfully)" || true; }
         [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "ERROR: PyTorch install failed."; exit 1; }
     else
         echo "Installing PyTorch (CPU-only, ~200MB)..."
-        "$VENV_PATH/bin/pip" install torch --index-url https://download.pytorch.org/whl/cpu 2>&1 \
+        "$VENV_PYTHON" -m pip install torch --index-url https://download.pytorch.org/whl/cpu 2>&1 \
             | { grep -E "^(Collecting|Downloading|Installing|Successfully)" || true; }
         [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "ERROR: PyTorch install failed."; exit 1; }
     fi
 fi
 
-"$VENV_PATH/bin/pip" install --progress-bar on -e "$CAIRN_HOME[test,ast,graph]" 2>&1 \
+"$VENV_PYTHON" -m pip install --progress-bar on -e "$CAIRN_HOME[test,ast,graph]" 2>&1 \
     | { grep -E "^(Collecting|Downloading|Installing|Successfully)" || true; }
 [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "ERROR: Dependency install failed. Run manually:"; \
          echo "  $VENV_PATH/bin/pip install -e \"$CAIRN_HOME[test,ast,graph]\""; exit 1; }
@@ -103,6 +103,27 @@ PYSQLITE_CHECK
 "$VENV_PYTHON" "$CAIRN_HOME/cairn/daemon.py" stop >/dev/null 2>&1 || true
 echo "Initializing database..."
 "$VENV_PYTHON" "$CAIRN_HOME/cairn/init_db.py"
+
+# Assert the ephemeral migrations actually reached the LIVE database. This is not
+# belt-and-braces: adding gate_status to the memory_deliveries INSERT while the
+# live DB lacked the column silently killed delivery logging for 20 hours, because
+# the write path is fail-soft and swallowed the error. Tests could never catch it —
+# they build their DBs through init_ephemeral, so they always have the migration.
+"$VENV_PYTHON" - <<'PYEOF' || { echo "ERROR: ephemeral schema migration did not apply."; exit 1; }
+import sys
+from cairn.relevance import _eph_path
+import pysqlite3 as sqlite3
+
+REQUIRED = {"gate_status", "engaged_method", "engaged", "reranker_model", "layer"}
+conn = sqlite3.connect(_eph_path(None))
+cols = {r[1] for r in conn.execute("pragma table_info(memory_deliveries)")}
+conn.close()
+missing = REQUIRED - cols
+if missing:
+    print("memory_deliveries missing columns: %s" % ", ".join(sorted(missing)))
+    sys.exit(1)
+PYEOF
+echo "Verified ephemeral schema (memory_deliveries migrations applied)."
 
 # --- Schema upgrade backfills (idempotent — only fills rows missing data) ---
 # v7 calibration_qf_embeddings sidecar — embeds existing calibration row qf
@@ -141,9 +162,15 @@ if [ -f "$CLAUDE_DIR/CLAUDE.md" ] && grep -q "Cairn — Global Memory" "$CLAUDE_
 fi
 
 # --- Global rules ---
-sed "s|{{CAIRN_HOME}}|$CAIRN_HOME|g" "$CAIRN_HOME/.claude/rules/memory-system.md" | \
+mkdir -p "$CLAUDE_DIR/reference"
+sed "s|{{CAIRN_HOME}}|$CAIRN_HOME|g; s|{{CLAUDE_DIR}}|$CLAUDE_DIR|g" "$CAIRN_HOME/.claude/rules/memory-system.md" | \
     sed "s|\\\$CAIRN_HOME|$CAIRN_HOME|g" > "$CLAUDE_DIR/rules/memory-system.md"
-cp "$CAIRN_HOME/.claude/rules/code-graph-navigation.md" "$CLAUDE_DIR/rules/code-graph-navigation.md"
+# On-demand reference — deliberately NOT in rules/, which is always-on context.
+sed "s|{{CAIRN_HOME}}|$CAIRN_HOME|g; s|{{CLAUDE_DIR}}|$CLAUDE_DIR|g" "$CAIRN_HOME/.claude/reference/cairn-query.md" \
+    > "$CLAUDE_DIR/reference/cairn-query.md"
+# Code-graph guidance now ships in the claude-context-hooks routing snippet.
+# Drop the copy older Cairn installs left in always-on context.
+rm -f "$CLAUDE_DIR/rules/code-graph-navigation.md"
 echo "Installed global rules."
 
 # --- Global settings (hooks) ---
@@ -243,7 +270,7 @@ fi
 # that corp proxies typically allow direct anyway.
 PROXY_STRIP=""
 if [ -n "$ALL_PROXY$HTTPS_PROXY$HTTP_PROXY$all_proxy$https_proxy$http_proxy" ]; then
-    PROXY_STRIP="-u ALL_PROXY -u HTTPS_PROXY -u HTTP_PROXY -u all_proxy -u https_proxy -u http_proxy"
+    PROXY_STRIP="-u ALL_PROXY -u all_proxy"
     echo "Unsetting proxy env vars for model download (httpx[socks] not required)."
 fi
 
@@ -315,6 +342,20 @@ set_env_kv() {  # idempotent KEY=VALUE upsert into cairn/.env
     echo "$1=$2" >> "$ENV_FILE.tmp"
     mv "$ENV_FILE.tmp" "$ENV_FILE"
 }
+set_env_default() {  # write KEY=VALUE only if KEY is absent — preserves local opt-ins
+    touch "$ENV_FILE"
+    if ! grep -q "^$1=" "$ENV_FILE" 2>/dev/null; then
+        echo "$1=$2" >> "$ENV_FILE"
+    fi
+}
+
+# Randomised reranker A/B (spec 2S.5). Seeded as DEFAULTS, not upserts: each arm
+# is a resident cross-encoder in the daemon, so this is opt-in per machine, and a
+# re-run of install.sh must not silently switch off an experiment someone started.
+# Arms are a comma-separated list of model names or local model dirs.
+set_env_default CAIRN_RERANKER_AB 0
+set_env_default CAIRN_RERANKER_AB_ARMS ""
+
 SYNC_ENABLED="${CAIRN_SYNC_ENABLED:-0}"
 set_env_kv CAIRN_SYNC_ENABLED "$SYNC_ENABLED"
 set_env_kv CAIRN_SYNC_SHARE_SESSIONS "${CAIRN_SYNC_SHARE_SESSIONS:-0}"
@@ -342,7 +383,7 @@ SHELL_RC="${CAIRN_SHELL_RC:-$HOME/.bashrc}"
 CAIRN_PROXY_ENABLED="${CAIRN_PROXY_ENABLED:-1}"
 if [ "${CAIRN_PROXY_ENABLED:-}" = "1" ]; then
     echo "Enabling cairn API proxy on 127.0.0.1:$PROXY_PORT (opt out with CAIRN_PROXY_ENABLED=0)..."
-    "$VENV_PATH/bin/pip" install --progress-bar off -e "$CAIRN_HOME[proxy]" >/dev/null 2>&1 \
+    "$VENV_PYTHON" -m pip install --progress-bar off -e "$CAIRN_HOME[proxy]" >/dev/null 2>&1 \
         || { echo "ERROR: aiohttp (proxy extra) install failed."; exit 1; }
     # Install/refresh the `c` launcher in the shell rc (marked block, idempotent).
     # Overrides any existing `c` alias; preserves --dangerously-skip-permissions.
@@ -427,8 +468,16 @@ CRON_DAEMON_HEALTH="*/15 * * * * ${CRON_PATH_PREFIX}$VENV_PYTHON $CAIRN_HOME/cai
 # days. Hourly; non-mutating probe, no-op on the happy path.
 CRON_CAPTURE_WATCHDOG="41 * * * * ${CRON_PATH_PREFIX}$VENV_PYTHON $CAIRN_HOME/cairn/capture_watchdog.py >> $CAIRN_HOME/logs/capture-watchdog.log 2>&1 $CRON_MARKER"
 
+# Signal liveness — is each instrumented signal still ARRIVING? Delivery logging
+# once died for 20 hours behind a fail-soft handler and nothing noticed, because
+# the healthy output and the broken output were both silence. Distinct from the
+# capture watchdog (held write locks) and the daemon health probe (a poisoned
+# model): this watches the DATA, not the machinery. Exits non-zero on a stale
+# signal. Daily at 08:23 — an odd minute so it does not pile onto the :00 mark.
+CRON_SIGNAL_LIVENESS="23 8 * * * ${CRON_PATH_PREFIX}$VENV_PYTHON $CAIRN_HOME/cairn/signal_liveness.py >> $CAIRN_HOME/logs/signal-liveness.log 2>&1 $CRON_MARKER"
+
 # Remove any existing cairn cron entries (including legacy contradiction_scan.py and calibration variants)
-EXISTING_CRON=$(crontab -l 2>/dev/null | grep -v "cairn-maintenance\|cairn/consolidate\|cairn/contradiction_scan\|cairn.analyser\|cairn.calibration_selfmod\|cairn.memory_selfmod\|cairn.ab_selfmod\|cairn.graph_fleet\|cairn.proxy.server\|cairn/capture_watchdog" || true)
+EXISTING_CRON=$(crontab -l 2>/dev/null | grep -v "cairn-maintenance\|cairn/consolidate\|cairn/contradiction_scan\|cairn.analyser\|cairn.calibration_selfmod\|cairn.memory_selfmod\|cairn.ab_selfmod\|cairn.graph_fleet\|cairn.proxy.server\|cairn/capture_watchdog\|cairn/signal_liveness" || true)
 
 # Install fresh entries
 echo "$EXISTING_CRON
@@ -441,8 +490,9 @@ $CRON_AB_SELFMOD
 $CRON_GRAPH_FLEET
 $CRON_PROXY
 $CRON_DAEMON_HEALTH
-$CRON_CAPTURE_WATCHDOG" | sed '/^$/d' | crontab -
-echo "Installed cron: consolidation + heal-vec (3:00 AM), contradiction scan (3:30 AM), calibration analyser (00:00), calibration selfmod (00:30), memory selfmod (00:45), ab selfmod (00:35), graph fleet sweep (hourly :17), daemon rerank health (every 15 min), capture watchdog (hourly :41)."
+$CRON_CAPTURE_WATCHDOG
+$CRON_SIGNAL_LIVENESS" | sed '/^$/d' | crontab -
+echo "Installed cron: consolidation + heal-vec (3:00 AM), contradiction scan (3:30 AM), calibration analyser (00:00), calibration selfmod (00:30), memory selfmod (00:45), ab selfmod (00:35), graph fleet sweep (hourly :17), daemon rerank health (every 15 min), capture watchdog (hourly :41), signal liveness (08:23)."
 
 # --- Code-graph fleet bootstrap ---
 # Build graphs for all local repos so every repo is graph-ready for first contact.
